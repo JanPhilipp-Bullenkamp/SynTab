@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 import numpy as np
 import trimesh
@@ -89,9 +90,21 @@ def postprocess_mesh(
     this stage (a separate one happens inside sdf_difference_with_labels for the
     initial raw mesh).
     """
+    t0 = time.perf_counter()
     mesh = remesh_and_smooth(mesh_raw, config)
+    print(f"[postprocess] remesh+smooth  dt={time.perf_counter()-t0:.3f}s  verts={len(mesh.vertices):,}", flush=True)
+
+    t0 = time.perf_counter()
     mesh = subdivide_to_target(mesh, target_vertices)
+    print(f"[postprocess] subdivide      dt={time.perf_counter()-t0:.3f}s  verts={len(mesh.vertices):,}", flush=True)
+
+    t0 = time.perf_counter()
     labels = transfer_vertex_labels_nearest(mesh_raw, labels_raw, mesh)
+    print(f"[postprocess] label_transfer dt={time.perf_counter()-t0:.3f}s", flush=True)
+
+    t0 = time.perf_counter()
     mesh = add_noise(mesh, magnitude=config.noise_magnitude, rng=rng)
     mesh = rescale_mesh(mesh, scale=scale)
+    print(f"[postprocess] noise+rescale  dt={time.perf_counter()-t0:.3f}s", flush=True)
+
     return mesh, labels

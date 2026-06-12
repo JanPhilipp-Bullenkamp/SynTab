@@ -11,6 +11,7 @@ Key difference from the original sdf_imprint.py:
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -176,6 +177,151 @@ def _rasterize_cutter_voxelized(
     return (inside_local + np.array([gx0, gy0, gz0], dtype=np.int64)).astype(np.int32)
 
 
+def _rasterize_to_indices(
+    cutter: trimesh.Trimesh,
+    origin: np.ndarray,
+    pitch: float,
+    dims: tuple,
+    method: str,
+) -> np.ndarray | None:
+    """Pure function: return voxel indices (K, 3) inside cutter, or None.
+
+    Does not write to any shared array — safe to call from threads.
+
+    Uses grid-clipped column-ray casting: shoots rays along the grid axis with
+    the most voxels (fewest column rays), restricted to the grid-clipped
+    bounding box of the cutter.  This is much faster than `cutter.voxelized()`
+    when cutter bounding boxes extend far outside the grid (common for pyramid
+    cutters that span well beyond the tablet surface).
+
+    Column processing is fully vectorised — no Python loops over columns.
+
+    Falls back to `cutter.voxelized()` or `cutter.contains()` on ray failure.
+    """
+    bounds = cutter.bounds
+    dims_arr = np.array(dims, dtype=np.int32)
+    imin = np.maximum(np.floor((bounds[0] - origin) / pitch).astype(np.int32) - 1, 0)
+    imax = np.minimum(np.ceil( (bounds[1] - origin) / pitch).astype(np.int32) + 1, dims_arr - 1)
+    if np.any(imax < imin):
+        return None
+
+    # Choose ray axis = grid axis with most voxels → fewest (col_a × col_b) columns.
+    # e.g. grid (173, 200, 64): ray_ax=1 gives 173*64=11 072 cols vs 34 600 for z-rays.
+    ray_ax = int(np.argmax(dims_arr))
+    ca0, ca1 = [i for i in range(3) if i != ray_ax]
+
+    ia0 = np.arange(int(imin[ca0]), int(imax[ca0]) + 1, dtype=np.int32)
+    ia1 = np.arange(int(imin[ca1]), int(imax[ca1]) + 1, dtype=np.int32)
+    IA0, IA1 = np.meshgrid(ia0, ia1, indexing="ij")   # (n0, n1)
+    flat_a0 = IA0.ravel()
+    flat_a1 = IA1.ravel()
+    n_rays = len(flat_a0)
+
+    ray_origins = np.empty((n_rays, 3), dtype=np.float64)
+    ray_origins[:, ca0] = origin[ca0] + flat_a0 * pitch
+    ray_origins[:, ca1] = origin[ca1] + flat_a1 * pitch
+    ray_start = min(float(bounds[0][ray_ax]) - pitch,
+                    float(origin[ray_ax]) + int(imin[ray_ax]) * pitch - pitch)
+    ray_origins[:, ray_ax] = ray_start
+
+    ray_dirs = np.zeros((n_rays, 3), dtype=np.float64)
+    ray_dirs[:, ray_ax] = 1.0
+
+    try:
+        hit_locs, hit_ray_idx, _ = cutter.ray.intersects_location(
+            ray_origins, ray_dirs, multiple_hits=True
+        )
+
+        if len(hit_locs) > 0:
+            # Sort hits by (column, ray-axis coord).
+            sort_order = np.lexsort((hit_locs[:, ray_ax], hit_ray_idx))
+            s_col = hit_ray_idx[sort_order]
+            s_r   = hit_locs[sort_order, ray_ax]
+
+            # Find which columns have exactly 2 hits (enter + exit for closed convex mesh).
+            u_col, first_pos, counts = np.unique(s_col, return_index=True, return_counts=True)
+            two_hit = counts == 2
+            if not np.any(two_hit):
+                hit_locs = np.empty((0, 3))   # trigger fallback
+            else:
+                fp = first_pos[two_hit]
+                r_in  = s_r[fp]
+                r_out = s_r[fp + 1]
+
+                o_r    = float(origin[ray_ax])
+                ir_min = int(imin[ray_ax])
+                ir_max = int(imax[ray_ax])
+
+                ir_in  = np.maximum(ir_min, np.ceil( (r_in  - o_r) / pitch).astype(np.int32))
+                ir_out = np.minimum(ir_max, np.floor((r_out - o_r) / pitch).astype(np.int32))
+
+                valid = ir_in <= ir_out
+                if not np.any(valid):
+                    return None
+
+                col_v  = u_col[two_hit][valid]
+                ir_in_v  = ir_in[valid]
+                ir_out_v = ir_out[valid]
+                ia0_v = flat_a0[col_v]
+                ia1_v = flat_a1[col_v]
+
+                # Fully vectorised range generation — no Python loop over columns.
+                n_vox = (ir_out_v - ir_in_v + 1).astype(np.int64)
+                total_vox = int(n_vox.sum())
+                if total_vox == 0:
+                    return None
+
+                g_starts = np.empty(len(n_vox), dtype=np.int64)
+                g_starts[0] = 0
+                if len(n_vox) > 1:
+                    g_starts[1:] = np.cumsum(n_vox[:-1])
+
+                all_idx = np.arange(total_vox, dtype=np.int64)
+                within  = all_idx - np.repeat(g_starts, n_vox)
+
+                ir_flat  = (np.repeat(ir_in_v, n_vox) + within).astype(np.int32)
+                ia0_flat = np.repeat(ia0_v, n_vox)
+                ia1_flat = np.repeat(ia1_v, n_vox)
+
+                result = np.empty((total_vox, 3), dtype=np.int32)
+                result[:, ca0]   = ia0_flat
+                result[:, ca1]   = ia1_flat
+                result[:, ray_ax] = ir_flat
+                return result
+
+    except Exception:
+        pass
+
+    # Fallback 1: cutter.voxelized (may be slow for large bounding boxes)
+    if method == "voxelize":
+        try:
+            vg = cutter.voxelized(pitch).fill()
+            mat = vg.matrix.astype(bool)
+            if not np.any(mat):
+                return None
+            vg_origin = _voxelgrid_origin(vg)
+            off = np.round((vg_origin - origin) / pitch).astype(int)
+            local_idx = np.argwhere(mat)
+            global_idx = local_idx + off
+            mask = np.all((global_idx >= 0) & (global_idx < dims_arr), axis=1)
+            return global_idx[mask].astype(np.int32) if np.any(mask) else None
+        except Exception:
+            pass
+
+    # Fallback 2: contains — tests all grid points in the clipped bounding box
+    ia0_all = np.arange(int(imin[ca0]), int(imax[ca0]) + 1)
+    ia1_all = np.arange(int(imin[ca1]), int(imax[ca1]) + 1)
+    ir_all  = np.arange(int(imin[ray_ax]), int(imax[ray_ax]) + 1)
+    G0, G1, GR = np.meshgrid(ia0_all, ia1_all, ir_all, indexing="ij")
+    pts_i = np.empty((G0.size, 3), dtype=np.int32)
+    pts_i[:, ca0]    = G0.ravel()
+    pts_i[:, ca1]    = G1.ravel()
+    pts_i[:, ray_ax] = GR.ravel()
+    pts_world = origin[None, :] + pitch * pts_i.astype(np.float64)
+    inside = cutter.contains(pts_world)
+    return pts_i[inside].astype(np.int32) if np.any(inside) else None
+
+
 def rasterize_cutter_into_grid(
     cutter: trimesh.Trimesh,
     occB: np.ndarray,
@@ -201,7 +347,7 @@ def rasterize_cutter_into_grid(
             cutter=cutter, occB=occB, origin=origin, pitch=pitch,
             return_indices=return_indices,
         )
-    raise ValueError("method must be 'voxelize' or 'contains'")
+    raise ValueError(f"method must be 'voxelize' or 'contains', got '{method}'")
 
 
 def mesh_from_sdf(sdf: np.ndarray, origin: np.ndarray, pitch: float) -> trimesh.Trimesh:
@@ -338,37 +484,42 @@ def sdf_difference_with_labels(
     # _dedup_voxel_labels, bounding peak memory to grid_cells × 4 bytes.
     label_grid = np.zeros(tuple(dims), dtype=np.int32)
 
-    skipped = 0
+    raster_threads = int(config.raster_threads)
     raster_t0 = time.perf_counter()
+    dims_tuple = tuple(int(d) for d in dims)
 
-    for idx, cutter in enumerate(cutter_meshes):
+    def _rasterize_one(args):
+        idx, cutter = args
         cbmin, cbmax = cutter.bounds
         if np.any(cbmax < bmin) or np.any(cbmin > bmax):
+            return idx, None, None
+        cid = int(getattr(cutter, "wedge_id", idx + 1))
+        return idx, cid, _rasterize_to_indices(cutter, origin, pitch, dims_tuple, cutter_raster)
+
+    if raster_threads > 1:
+        with ThreadPoolExecutor(max_workers=raster_threads) as ex:
+            results = list(ex.map(_rasterize_one, enumerate(cutter_meshes)))
+    else:
+        results = [_rasterize_one(item) for item in enumerate(cutter_meshes)]
+
+    skipped = 0
+    for idx, cid, inside_idx in results:
+        if cid is None:
             skipped += 1
             continue
-
-        cid = int(getattr(cutter, "wedge_id", idx + 1))
-
-        inside_idx = rasterize_cutter_into_grid(
-            cutter=cutter, occB=occB, origin=origin, pitch=pitch,
-            method=cutter_raster, return_indices=True,
-        )
-
-        if inside_idx is not None and inside_idx.size > 0:
-            ix = inside_idx[:, 0]
-            iy = inside_idx[:, 1]
-            iz = inside_idx[:, 2]
-            if order_bias:
-                # last writer wins — later wedge id overwrites earlier
-                label_grid[ix, iy, iz] = cid
-            else:
-                # first writer wins — only write to unlabelled voxels
-                mask = label_grid[ix, iy, iz] == 0
-                label_grid[ix[mask], iy[mask], iz[mask]] = cid
+        if inside_idx is None or inside_idx.size == 0:
+            continue
+        ix, iy, iz = inside_idx[:, 0], inside_idx[:, 1], inside_idx[:, 2]
+        occB[ix, iy, iz] = True
+        if order_bias:
+            label_grid[ix, iy, iz] = cid
+        else:
+            mask = label_grid[ix, iy, iz] == 0
+            label_grid[ix[mask], iy[mask], iz[mask]] = cid
 
         if debug and ((idx + 1) % max(1, int(debug_every)) == 0):
             _dbg(
-                f"[sdf] rasterized {idx + 1}/{len(cutter_meshes)} "
+                f"[sdf] merged {idx + 1}/{len(cutter_meshes)} "
                 f"elapsed={time.perf_counter() - raster_t0:.1f}s"
             )
 
@@ -378,12 +529,16 @@ def sdf_difference_with_labels(
         f"elapsed={time.perf_counter() - raster_t0:.2f}s"
     )
 
+    # sdfA and sdfB are independent — compute in parallel threads.
+    # scipy.ndimage.distance_transform_edt releases the GIL, so two threads
+    # run truly concurrently on multi-core hardware.
     t0 = time.perf_counter()
-    sdfA = sdf_from_occupancy(occA, pitch=pitch, dtype=sdf_dtype)
-    _dbg(f"[sdf] sdfA done {time.perf_counter() - t0:.2f}s")
-    t0 = time.perf_counter()
-    sdfB = sdf_from_occupancy(occB, pitch=pitch, dtype=sdf_dtype)
-    _dbg(f"[sdf] sdfB done {time.perf_counter() - t0:.2f}s")
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futA = ex.submit(sdf_from_occupancy, occA, pitch=pitch, dtype=sdf_dtype)
+        futB = ex.submit(sdf_from_occupancy, occB, pitch=pitch, dtype=sdf_dtype)
+        sdfA = futA.result()
+        sdfB = futB.result()
+    _dbg(f"[sdf] sdfA+sdfB done (parallel) {time.perf_counter() - t0:.2f}s")
     del occA
     del occB
 

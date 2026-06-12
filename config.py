@@ -77,12 +77,15 @@ class SdfConfig:
     eps_active_fraction: float = 0.5   # eps_active = fraction * pitch
     base_label: int = 1                # label assigned to unlabelled tablet surface
     cutter_label_offset: int = 1       # offset added to wedge_id for final label
+    raster_threads: int = 4            # parallel threads for cutter rasterization (1 = serial)
 
     def __post_init__(self):
         if self.target_pitch <= 0:
             raise ValueError("SdfConfig: target_pitch must be > 0")
         if self.max_grid <= 0:
             raise ValueError("SdfConfig: max_grid must be > 0")
+        if self.raster_threads < 1:
+            raise ValueError("SdfConfig: raster_threads must be >= 1")
 
 
 @dataclass(frozen=True)
@@ -90,7 +93,7 @@ class PostprocessConfig:
     """Mesh post-processing pipeline parameters."""
     target_vertices_range: tuple = (70_000, 200_000)
     noise_magnitude: float = 0.0018
-    remesh_iterations: int = 9
+    remesh_iterations: int = 3
     smooth_iterations: int = 5
     smooth_lambda: float = 0.5   # Taubin λ — previously hardcoded in util
     smooth_mu: float = -0.53     # Taubin μ — previously hardcoded in util
@@ -121,12 +124,28 @@ class LayoutConfig:
     tangent_delta: float = 1e-4         # finite-difference step for tangent frames
     arclength_u_samples: int = 1024     # samples for u-direction arc-length
     arclength_v_samples: int = 2048     # samples for v-band arc-length
+    # Margins
+    margin_top_frac: float = 0.04       # fraction of meridian arc to skip at top
+    margin_bottom_frac: float = 0.04    # fraction of meridian arc to skip at bottom
+    margin_side_frac: float = 0.05      # fraction of band-length to skip per side
+    # Row alignment
+    row_phase: float = 0.0              # fixed u-phase for all rows (0 = front-center start)
+    # Justified filling
+    justify_rows: bool = True           # spread signs evenly across each row
+    justify_threshold: float = 0.55     # min fill ratio to justify; below → center block
+    # Column-block layout
+    n_columns: int = 1                  # 1 = full-width rows; >1 = column-block layout
+    column_gap_frac: float = 0.03       # gap between columns as fraction of band-length
 
     def __post_init__(self):
         if self.band_axis not in ("y", "z"):
             raise ValueError(f"LayoutConfig: band_axis must be 'y' or 'z', got '{self.band_axis}'")
         if self.project_iters < 1:
             raise ValueError("LayoutConfig: project_iters must be >= 1")
+        if self.n_columns < 1:
+            raise ValueError("LayoutConfig: n_columns must be >= 1")
+        if not (0.0 <= self.justify_threshold <= 1.0):
+            raise ValueError("LayoutConfig: justify_threshold must be in [0, 1]")
 
 
 @dataclass(frozen=True)

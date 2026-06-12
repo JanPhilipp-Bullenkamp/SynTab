@@ -81,7 +81,7 @@ def _generate_single_tablet(
     max_attempts = cfg.generation.max_attempts
     for attempt in range(1, max_attempts + 1):
         atag = f"{tag}[attempt {attempt}/{max_attempts}]"
-        t0 = time.perf_counter()
+        t_attempt = time.perf_counter()
         try:
             height  = float(rng.uniform(*cfg.geometry.height_range))
             width   = float(rng.uniform(*cfg.geometry.width_range))
@@ -94,15 +94,20 @@ def _generate_single_tablet(
                 f"eps={epsilon:.4f} eta={eta:.4f} scale={scale:.2f}"
             )
 
+            ts = time.perf_counter()
             sign_codes = resolve_sign_codes(
                 sign_source, sign_list, paleocodes_path, rng, cfg.generation
             )
             parsed_raw = parse_signs(sign_codes, config=cfg.paleocodage)
             parsed_signs, n_dropped = drop_signs_without_wedges(parsed_raw)
-            _log(f"{atag} signs={len(parsed_signs)} (dropped_empty={n_dropped})")
+            _log(
+                f"{atag} [parse] signs={len(parsed_signs)} dropped={n_dropped} "
+                f"dt={time.perf_counter()-ts:.3f}s"
+            )
             if not parsed_signs:
                 raise ValueError("No valid signs with wedge strokes after filtering")
 
+            ts = time.perf_counter()
             placed = layout_signs_on_superquadric(
                 parsed_signs,
                 a=height, b=width, c=depth,
@@ -111,8 +116,9 @@ def _generate_single_tablet(
                 rng=rng,
                 allowed_faces=set(faces),
             )
-            _log(f"{atag} layout done wedges={len(placed)}")
+            _log(f"{atag} [layout] wedges={len(placed)} dt={time.perf_counter()-ts:.3f}s")
 
+            ts = time.perf_counter()
             wedges_3d = map_placed_wedges3d_to_surface(
                 placed,
                 config=cfg.carving,
@@ -121,12 +127,15 @@ def _generate_single_tablet(
             )
             if not wedges_3d:
                 raise ValueError("No wedge placements mapped to surface")
+            _log(f"{atag} [imprint] wedges_3d={len(wedges_3d)} dt={time.perf_counter()-ts:.3f}s")
 
+            ts = time.perf_counter()
             wedge_meshes = build_wedge_meshes(wedges_3d, config=cfg.carving)
-            _log(f"{atag} wedge meshes built count={len(wedge_meshes)}")
+            _log(f"{atag} [build_meshes] count={len(wedge_meshes)} dt={time.perf_counter()-ts:.3f}s")
 
             pitch = _compute_pitch(height, width, depth, cfg)
-            _log(f"{atag} sdf start pitch={pitch:.7f}")
+            _log(f"{atag} [sdf] pitch={pitch:.7f}")
+            ts = time.perf_counter()
             imprinted_mesh_raw, labels_raw = sdf_difference_with_labels(
                 wedge_meshes,
                 config=cfg.sdf,
@@ -138,8 +147,9 @@ def _generate_single_tablet(
                 debug=cfg.generation.debug,
             )
             _log(
-                f"{atag} sdf done verts={len(imprinted_mesh_raw.vertices)} "
-                f"dt={time.perf_counter() - t0:.2f}s"
+                f"{atag} [sdf] done verts={len(imprinted_mesh_raw.vertices)} "
+                f"dt={time.perf_counter()-ts:.3f}s  "
+                f"attempt_total={time.perf_counter()-t_attempt:.3f}s"
             )
             break
 
@@ -154,7 +164,8 @@ def _generate_single_tablet(
         return
 
     target_vertices = int(rng.integers(*cfg.postprocess.target_vertices_range))
-    _log(f"{tag} postprocess start target_vertices={target_vertices}")
+    _log(f"{tag} [postprocess] start target_vertices={target_vertices}")
+    ts = time.perf_counter()
 
     mesh, labels = postprocess_mesh(
         imprinted_mesh_raw,
@@ -164,9 +175,12 @@ def _generate_single_tablet(
         rng=rng,
         scale=scale,
     )
+    _log(f"{tag} [postprocess] done verts={len(mesh.vertices):,} dt={time.perf_counter()-ts:.3f}s")
 
+    ts = time.perf_counter()
     mesh.export(mesh_path)
     export_labels(labels, labels_path)
+    _log(f"{tag} [export] dt={time.perf_counter()-ts:.3f}s")
 
     if annotations_path:
         export_webannotation_3d(
@@ -263,8 +277,9 @@ def generate_dataset(
 
 
 if __name__ == "__main__":
+    from config import GenerationConfig
     generate_dataset(
-        cfg=TabletConfig(),
+        cfg=TabletConfig(generation=GenerationConfig(debug=True, base_seed=42)),
         paleocodes_path="./paleocodes.json",
         output_dirs={
             "mesh":        "./out/plys/",
