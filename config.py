@@ -70,9 +70,9 @@ class WedgeCarvingConfig:
 @dataclass(frozen=True)
 class SdfConfig:
     """Voxelisation and SDF boolean-difference parameters."""
-    target_pitch: float = 1.0 / 120.0  # desired voxel size (normalised units)
+    target_pitch: float = 1.0 / 180.0  # desired voxel size (normalised units)
     padding: float = 1.5                # padding around bounds in voxels
-    max_grid: int = 500                 # max grid dimension; caps memory use
+    max_grid: int = 700                 # max grid dimension; caps memory use
     base_bounds_margin: float = 0.02   # margin around base superquadric
     eps_active_fraction: float = 0.5   # eps_active = fraction * pitch
     base_label: int = 1                # label assigned to unlabelled tablet surface
@@ -151,9 +151,9 @@ class LayoutConfig:
 @dataclass(frozen=True)
 class PaleocodageConfig:
     """Controls how PaleoCodage strings are decoded into 2-D wedge positions."""
-    stroke_length: float = 30.0
-    step_x: float = 10.0
-    step_y: float = 7.0
+    stroke_length: float = 15.0
+    step_x: float = 5.0
+    step_y: float = 3.5
     big_scale: float = 1.5      # scale for uppercase / 'B'-prefixed wedges
     small_scale: float = 0.5    # scale for 's'-prefixed wedges
     rotation_constant: float = 15.0  # angle delta for '<' / '>' operators

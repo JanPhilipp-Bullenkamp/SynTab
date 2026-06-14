@@ -486,8 +486,9 @@ def layout_signs_on_superquadric(
                     center_hint=center3,
                 )
 
+                t_v_pos = t_v  # unflipped: position offsets use paleocode y-up → 3D y-up
                 if config.flip_vertical_axis:
-                    t_v = -t_v
+                    t_v = -t_v  # flipped t_v used only for direction vectors
 
                 char_in_col += 1
                 x0 = -0.5 * d['sign_w']
@@ -497,7 +498,7 @@ def layout_signs_on_superquadric(
                     wx = x0 + float(wedge.pos[0]) * d['scale']
                     wy = y0 + float(wedge.pos[1]) * d['scale']
 
-                    p3 = center3 + wx * t_u + wy * t_v
+                    p3 = center3 + wx * t_u + wy * t_v_pos
                     p3 = project_to_superquadric(
                         p3, a, b, c, epsilon, eta, iters=config.project_iters
                     )
