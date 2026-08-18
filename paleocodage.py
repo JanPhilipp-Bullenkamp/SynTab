@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import re
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, Iterator, List
 
 import numpy as np
 
@@ -53,12 +53,33 @@ WEDGE_TOKENS = {
 }
 
 
+class WedgeSize:
+    """The three wedge sizes the notation distinguishes.
+
+    Deliberately separate from `size_scale`: that number also carries
+    `OPERATOR_TO_SCALING`, which doubles the Winkelhaken as a *drawing*
+    convention rather than because the impression is bigger.  A plain `w`
+    therefore has size_scale 2.0 but is a NORMAL wedge, and `sw` has size_scale
+    1.0 but is SMALL — so the class has to come from the modifiers, not from the
+    scale factor.
+    """
+    SMALL = "small"
+    NORMAL = "normal"
+    LARGE = "large"
+
+    ALL = ("small", "normal", "large")
+
+
 @dataclass(frozen=True)
 class Wedge2D:
     pos: np.ndarray
     direction: np.ndarray
     wedge_type: str
     size_scale: float
+    # Which of WedgeSize the notation asked for: 's' prefix → SMALL, an
+    # uppercase token → LARGE, otherwise NORMAL.  Drives the carving depth and
+    # impression angle in `imprint.map_placed_wedges3d_to_surface`.
+    size_class: str = WedgeSize.NORMAL
 
 
 @dataclass(frozen=True)
@@ -84,6 +105,7 @@ class ParsedSign:
                 direction=w.direction,
                 wedge_type=w.wedge_type,
                 size_scale=w.size_scale,
+                size_class=w.size_class,
             )
             for w in self.wedges
         ]
@@ -96,7 +118,42 @@ def _angle_to_dir(angle_degrees: float) -> np.ndarray:
     return np.array([np.sin(theta), np.cos(theta)], dtype=float)
 
 
-def parse_paleocode(code: str, config: PaleocodageConfig | None = None) -> ParsedSign:
+@dataclass(frozen=True)
+class ParseStep:
+    """Decoder state immediately after consuming one character of a paleocode.
+
+    Yielded by `iter_paleocode_steps` so callers can follow the decode — the
+    figure that explains the notation walks a code character by character and
+    needs the cursor position at each one.
+    """
+    index: int              # position of the consumed character in the code
+    char: str
+    curx: float             # cursor, in paleocodage units
+    cury: float
+    emitted: Wedge2D | None  # wedge placed by this character, if any
+    smaller: bool           # pending 's' (half-size) modifier
+    mirror: bool            # pending '!' (mirror) modifier
+    rot: float              # pending '<' / '>' rotation, degrees
+
+    # Live decoder list plus how many entries existed at this step, so taking a
+    # snapshot stays O(1) during parsing and only costs when actually read.
+    _wedges: List[Wedge2D] = field(repr=False, default_factory=list)
+    _count: int = field(repr=False, default=0)
+
+    @property
+    def wedges(self) -> tuple[Wedge2D, ...]:
+        """Wedges emitted up to and including this step."""
+        return tuple(self._wedges[: self._count])
+
+
+def iter_paleocode_steps(
+    code: str, config: PaleocodageConfig | None = None
+) -> Iterator[ParseStep]:
+    """Decode `code`, yielding a ParseStep for every character consumed.
+
+    This is the single implementation of the PaleoCodage grammar;
+    `parse_paleocode` is a thin consumer of it.
+    """
     if config is None:
         config = PaleocodageConfig()
 
@@ -109,16 +166,22 @@ def parse_paleocode(code: str, config: PaleocodageConfig | None = None) -> Parse
 
     wedges: List[Wedge2D] = []
 
-    i = 0
-    while i < len(code):
-        ch = code[i]
+    for i, ch in enumerate(code):
+        emitted: Wedge2D | None = None
 
         if ch == "s":
             smaller = True
-            i += 1
-            continue
 
-        if ch in WEDGE_TOKENS:
+        elif ch in WEDGE_TOKENS:
+            # A pending 's' wins over the token's case: `sA` is a small wedge
+            # drawn from the big variant, and reads as small on the tablet.
+            if smaller:
+                size_class = WedgeSize.SMALL
+            elif ch.isupper():
+                size_class = WedgeSize.LARGE
+            else:
+                size_class = WedgeSize.NORMAL
+
             base_scale = config.big_scale if ch.isupper() else 1.0
             if smaller:
                 base_scale *= config.small_scale
@@ -138,22 +201,19 @@ def parse_paleocode(code: str, config: PaleocodageConfig | None = None) -> Parse
             if mirror:
                 angle += 180.0
 
-            direction = _angle_to_dir(angle)
-            wedges.append(
-                Wedge2D(
-                    pos=pos,
-                    direction=direction,
-                    wedge_type=ch.lower(),
-                    size_scale=size_scale,
-                )
+            emitted = Wedge2D(
+                pos=pos,
+                direction=_angle_to_dir(angle),
+                wedge_type=ch.lower(),
+                size_scale=size_scale,
+                size_class=size_class,
             )
+            wedges.append(emitted)
 
             mirror = False
             rot = 0.0
-            i += 1
-            continue
 
-        if ch == "-":
+        elif ch == "-":
             curx += config.step_x
             cury = starty
         elif ch == "_":
@@ -188,7 +248,21 @@ def parse_paleocode(code: str, config: PaleocodageConfig | None = None) -> Parse
         elif ch == ">":
             rot += config.rotation_constant
 
-        i += 1
+        yield ParseStep(
+            index=i, char=ch, curx=curx, cury=cury, emitted=emitted,
+            smaller=smaller, mirror=mirror, rot=rot,
+            _wedges=wedges, _count=len(wedges),
+        )
+
+
+def parse_paleocode(code: str, config: PaleocodageConfig | None = None) -> ParsedSign:
+    if config is None:
+        config = PaleocodageConfig()
+
+    wedges: List[Wedge2D] = []
+    for step in iter_paleocode_steps(code, config=config):
+        if step.emitted is not None:
+            wedges.append(step.emitted)
 
     if wedges:
         positions = np.stack([w.pos for w in wedges], axis=0)

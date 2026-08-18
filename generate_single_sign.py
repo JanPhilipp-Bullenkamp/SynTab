@@ -15,7 +15,13 @@ import time
 import numpy as np
 
 from annotation_export import export_webannotation_3d
-from config import PostprocessConfig, TabletConfig, WedgeCarvingConfig
+from config import (
+    LayoutConfig,
+    PostprocessConfig,
+    TabletConfig,
+    WedgeCarvingConfig,
+    WedgeSizeConfig,
+)
 from directions import face_from_normal
 from imprint import build_wedge_meshes, map_placed_wedges3d_to_surface
 from layout3d import (
@@ -24,6 +30,7 @@ from layout3d import (
     project_to_superquadric,
     superquadric_F_and_grad,
     tangent_frame_from_param,
+    writing_frame,
 )
 from paleocodage import parse_signs
 from postprocess import postprocess_mesh
@@ -45,20 +52,25 @@ SCALE_MM = 10.0   # final mesh scale in mm
 SIGN_HEIGHT_FRAC = 0.15   # sign height as fraction of tablet height (2 * TABLET_W)
 
 # ---------------------------------------------------------------------------
-# Wedge carving — ranges; each wedge draws a random value from [min, max]
+# Wedge carving — ranges; each wedge draws a random value from [min, max].
+# Narrow ranges keep this debug render tidy; the same block is applied to every
+# size class so a single sign shows the notation's own size differences rather
+# than the sampling spread.
 # ---------------------------------------------------------------------------
-WEDGE_DEPTH_MIN = 0.050
-WEDGE_DEPTH_MAX = 0.070
-WEDGE_ANGLE_MIN = 7.0
-WEDGE_ANGLE_MAX = 12.0
-WEDGE_TILT_MIN  = -3.0
-WEDGE_TILT_MAX  = 3.0
+DEBUG_WEDGE_RANGES = WedgeSizeConfig(
+    min_depth=0.050, max_depth=0.070,
+    min_angle=7.0, max_angle=12.0,
+    min_tilt_angle=-3.0, max_tilt_angle=3.0,
+)
 
 PALEOCODES_PATH = "./paleocodes.json"
 OUT_DIR = "./out_single"
 
 
-def _place_sign_at_front_center(sign, scale: float, a, b, c, epsilon, eta) -> list[PlacedWedge3D]:
+def _place_sign_at_front_center(
+    sign, scale: float, a, b, c, epsilon, eta,
+    layout_config: LayoutConfig | None = None,
+) -> list[PlacedWedge3D]:
     """Place one sign centred on the front face (u=π/2, v=0) of the superquadric."""
     u_center = np.pi / 2   # front face
     v_center = 0.35        # slightly above equator (range: -π/2 bottom … +π/2 top)
@@ -72,9 +84,9 @@ def _place_sign_at_front_center(sign, scale: float, a, b, c, epsilon, eta) -> li
         u_center, v_center, a, b, c, epsilon, eta,
         band_axis="y", project_iters=8, delta=1e-4, center_hint=center3,
     )
-    t_u = -t_u  # at u=π/2 the natural t_u points in -x; negate so sign is not mirrored
-    t_v_pos = t_v   # unflipped: +v points upward, paleocode y-up maps directly to 3D y-up
-    t_v = -t_v      # flipped: used for direction vectors so tail angles stay correct
+    # Shared with the production layout so the two cannot drift apart; both
+    # wedge positions and wedge directions must use this one frame.
+    e_x, e_y = writing_frame(t_u, t_v, layout_config or LayoutConfig())
 
     _, g = superquadric_F_and_grad(center3, a, b, c, epsilon, eta)
     n3 = g / max(1e-12, np.linalg.norm(g))
@@ -91,14 +103,14 @@ def _place_sign_at_front_center(sign, scale: float, a, b, c, epsilon, eta) -> li
         wx = x0 + float(wedge.pos[0]) * scale
         wy = y0 + float(wedge.pos[1]) * scale
 
-        p3 = center3 + wx * t_u + wy * t_v_pos
+        p3 = center3 + wx * e_x + wy * e_y
         p3 = project_to_superquadric(p3, a, b, c, epsilon, eta, iters=8)
 
         _, g_w = superquadric_F_and_grad(p3, a, b, c, epsilon, eta)
         n3_w = g_w / max(1e-12, np.linalg.norm(g_w))
 
         d2 = np.array(wedge.direction, dtype=float).reshape(2,)
-        d3 = d2[0] * t_u + d2[1] * t_v
+        d3 = d2[0] * e_x + d2[1] * e_y
         d3 = d3 - np.dot(d3, n3_w) * n3_w
         d3 = d3 / max(1e-12, np.linalg.norm(d3))
 
@@ -107,6 +119,7 @@ def _place_sign_at_front_center(sign, scale: float, a, b, c, epsilon, eta) -> li
             wedge_index=wedge_idx,
             wedge_type=wedge.wedge_type,
             size_scale=wedge.size_scale,
+            size_class=wedge.size_class,
             pos3=p3,
             tail_dir3=d3,
             normal3=n3_w,
@@ -157,9 +170,9 @@ def main() -> None:
 
     cfg = TabletConfig(
         carving=WedgeCarvingConfig(
-            min_depth=WEDGE_DEPTH_MIN, max_depth=WEDGE_DEPTH_MAX,
-            min_angle=WEDGE_ANGLE_MIN, max_angle=WEDGE_ANGLE_MAX,
-            min_tilt_angle=WEDGE_TILT_MIN, max_tilt_angle=WEDGE_TILT_MAX,
+            normal=DEBUG_WEDGE_RANGES,
+            small=DEBUG_WEDGE_RANGES,
+            large=DEBUG_WEDGE_RANGES,
         ),
         postprocess=PostprocessConfig(
             remesh_iterations=3,

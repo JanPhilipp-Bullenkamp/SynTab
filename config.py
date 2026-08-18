@@ -43,28 +43,78 @@ class GeometryConfig:
 
 
 @dataclass(frozen=True)
-class WedgeCarvingConfig:
-    """Randomisation ranges for individual wedge carving."""
+class WedgeSizeConfig:
+    """Randomisation ranges for one wedge size class.
+
+    The impression angle is the stylus inclination: a low angle drags a long
+    thin stroke, a high angle leaves a short compact head.  So a large wedge —
+    pressed harder and held flatter — gets a deeper range and a lower angle,
+    and a small wedge the reverse.
+    """
     min_depth: float = 0.025
     max_depth: float = 0.055
     min_angle: float = 11.0
     max_angle: float = 29.0
     min_tilt_angle: float = -12.0
     max_tilt_angle: float = 28.0
+
+    def __post_init__(self):
+        for lo_name, hi_name in (
+            ("min_depth", "max_depth"),
+            ("min_angle", "max_angle"),
+            ("min_tilt_angle", "max_tilt_angle"),
+        ):
+            lo, hi = getattr(self, lo_name), getattr(self, hi_name)
+            if lo >= hi:
+                raise ValueError(
+                    f"WedgeSizeConfig.{lo_name} ({lo}) must be < {hi_name} ({hi})"
+                )
+        if self.min_depth <= 0:
+            raise ValueError(f"WedgeSizeConfig: min_depth ({self.min_depth}) must be > 0")
+
+
+@dataclass(frozen=True)
+class WedgeCarvingConfig:
+    """Wedge carving parameters, split by the notation's three size classes.
+
+    `normal` carries the values the whole pipeline used before size classes
+    existed, so a sign built only from unmodified lowercase tokens carves
+    exactly as it did.  `small` and `large` are starting points — this is a
+    realism knob, best judged from `viz` figure f5b.
+    """
+    normal: WedgeSizeConfig = field(default_factory=WedgeSizeConfig)
+    small: WedgeSizeConfig = field(
+        default_factory=lambda: WedgeSizeConfig(
+            min_depth=0.015, max_depth=0.032,
+            min_angle=18.0, max_angle=36.0,
+        )
+    )
+    large: WedgeSizeConfig = field(
+        default_factory=lambda: WedgeSizeConfig(
+            min_depth=0.045, max_depth=0.075,
+            min_angle=7.0, max_angle=20.0,
+        )
+    )
+
     base_wedge_size: float = 0.65
-    # Previously hardcoded constants promoted to config
-    wedge_beta: float = -45.0               # rotation angle in get_wedge_trafo
     tangent_collinear_threshold: float = 0.9  # near-parallel check in imprint
 
     def __post_init__(self):
-        if self.min_depth >= self.max_depth:
-            raise ValueError(f"WedgeCarvingConfig: min_depth ({self.min_depth}) must be < max_depth ({self.max_depth})")
-        if self.min_angle >= self.max_angle:
-            raise ValueError(f"WedgeCarvingConfig: min_angle ({self.min_angle}) must be < max_angle ({self.max_angle})")
-        if self.min_tilt_angle >= self.max_tilt_angle:
-            raise ValueError(f"WedgeCarvingConfig: min_tilt_angle ({self.min_tilt_angle}) must be < max_tilt_angle ({self.max_tilt_angle})")
+        for name in ("normal", "small", "large"):
+            if not isinstance(getattr(self, name), WedgeSizeConfig):
+                raise TypeError(f"WedgeCarvingConfig.{name} must be a WedgeSizeConfig")
         if self.base_wedge_size <= 0:
-            raise ValueError(f"WedgeCarvingConfig: base_wedge_size must be > 0")
+            raise ValueError("WedgeCarvingConfig: base_wedge_size must be > 0")
+
+    def for_class(self, size_class: str) -> WedgeSizeConfig:
+        """Ranges for a `paleocodage.WedgeSize` value.
+
+        Unknown classes fall back to `normal` rather than raising: a sign that
+        somehow carries an unexpected label should still carve.
+        """
+        return {"small": self.small, "large": self.large}.get(
+            str(size_class), self.normal
+        )
 
 
 @dataclass(frozen=True)
@@ -119,7 +169,13 @@ class LayoutConfig:
     small_sign_bias: float = 0.7
     project_iters: int = 8              # Newton iterations for surface projection
     band_axis: str = "y"
-    flip_vertical_axis: bool = True
+    # PaleoCodage's 2D frame is screen-like (+x left→right, +y downwards) and has
+    # to be mapped onto the surface tangent frame; see `layout3d.writing_frame`.
+    # The defaults give correctly oriented signs — setting either to False
+    # deliberately mirrors the writing on that axis.
+    flip_vertical_axis: bool = True     # map paleocode +y (down) to tablet down
+    flip_horizontal_axis: bool = True   # map paleocode +x to left→right as seen
+                                        # from outside, and run rows the same way
     global_center_separation: float = 0.25
     tangent_delta: float = 1e-4         # finite-difference step for tangent frames
     arclength_u_samples: int = 1024     # samples for u-direction arc-length
@@ -152,7 +208,7 @@ class LayoutConfig:
 class PaleocodageConfig:
     """Controls how PaleoCodage strings are decoded into 2-D wedge positions."""
     stroke_length: float = 15.0
-    step_x: float = 5.0
+    step_x: float = 3.0
     step_y: float = 3.5
     big_scale: float = 1.5      # scale for uppercase / 'B'-prefixed wedges
     small_scale: float = 0.5    # scale for 's'-prefixed wedges
@@ -179,6 +235,19 @@ class GenerationConfig:
             raise ValueError("GenerationConfig: max_attempts must be >= 1")
         if self.workers < 1:
             raise ValueError("GenerationConfig: workers must be >= 1")
+
+
+def _field_default(f: dataclasses.Field) -> Any:
+    """The declared default of a dataclass field, or None if it has none.
+
+    Used to recognise nested sub-configs during deserialisation; see
+    `TabletConfig.from_dict`.
+    """
+    if f.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
+        return f.default_factory()                     # type: ignore[misc]
+    if f.default is not dataclasses.MISSING:
+        return f.default
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -237,8 +306,20 @@ class TabletConfig:
             for k, v in sub_dict.items():
                 if k not in fmap:
                     continue
+                # Nested sub-configs (WedgeCarvingConfig's per-size blocks) come
+                # back from JSON as plain dicts.  Without this they would be
+                # stored as dicts and only fail much later, at the first
+                # attribute access during generation.
+                #
+                # The field's declared type is no help: this module uses
+                # `from __future__ import annotations`, so `field.type` is the
+                # string "WedgeSizeConfig".  The default value carries the real
+                # class instead.
+                nested = _field_default(fmap[k])
+                if isinstance(v, dict) and dataclasses.is_dataclass(nested):
+                    v = _coerce(type(nested), v)
                 # JSON deserialises tuples as lists; restore them.
-                if isinstance(v, list):
+                elif isinstance(v, list):
                     v = tuple(v)
                 kwargs[k] = v
             return sub_cls(**kwargs)

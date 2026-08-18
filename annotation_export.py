@@ -124,6 +124,7 @@ def export_webannotation_3d(
             _textual_body("Depth", float(wedge.depth) * float(scale)),
             _textual_body("Angle", float(wedge.angle)),
             _textual_body("SizeScale", float(wedge.size_scale)),
+            _textual_body("Wedgesize", getattr(wedge, "size_class", "normal")),
         ]
         if sign_code:
             body.append(_textual_body("Paleocode", sign_code))

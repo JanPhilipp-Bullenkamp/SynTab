@@ -15,6 +15,7 @@ class PlacedWedge3D:
     wedge_index: int
     wedge_type: str
     size_scale: float
+    size_class: str
     pos3: np.ndarray
     tail_dir3: np.ndarray
     normal3: np.ndarray
@@ -234,6 +235,27 @@ def tangent_frame_from_param(
     return t_u, t_v, n, p
 
 
+def writing_frame(
+    t_u: np.ndarray, t_v: np.ndarray, config: LayoutConfig
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Map PaleoCodage's 2D axes onto the surface; returns (e_x, e_y).
+
+    PaleoCodage uses screen-like coordinates: +x reads left to right and +y runs
+    *downwards* (see `paleocodage._angle_to_dir`).  On the tablet, `t_v` points up
+    the surface, and `tangent_frame_from_param` builds `t_u` such that
+    cross(t_u, t_v) is the *inward* normal — so `t_u` runs leftward as seen from
+    outside.  The writing frame is therefore (-t_u, -t_v).
+
+    Wedge positions and wedge tail directions must both be expressed in this
+    frame.  Using different axes for the two mirrors a sign while leaving its
+    individual wedges pointing the right way, which is why the error is easy to
+    miss: the wedges look correct, only their arrangement is reflected.
+    """
+    e_x = -t_u if config.flip_horizontal_axis else t_u
+    e_y = -t_v if config.flip_vertical_axis else t_v
+    return e_x, e_y
+
+
 def _band_arclength_u(
     v, a, b, c, epsilon, eta,
     *, band_axis: str, project_iters: int, n_samples: int,
@@ -352,8 +374,16 @@ def layout_signs_on_superquadric(
             widths_at_target = sign_aspects * target_height
             widths_effective = widths_at_target + 2.0 * pad
 
-            def s_to_u(s: float, _bl=band_length, _sc=s_cum, _us=u_samp, _up=u_phase) -> float:
-                u_base = float(np.interp(np.clip(s, 0.0, _bl), _sc, _us))
+            # Rows advance along the writing frame's +x axis.  When that axis is
+            # -t_u (the corrected default), arc length must walk the band in the
+            # -u direction, or signs would read left-to-right internally while
+            # the row itself ran the other way.
+            _rev = bool(config.flip_horizontal_axis)
+
+            def s_to_u(s: float, _bl=band_length, _sc=s_cum, _us=u_samp,
+                       _up=u_phase, _rv=_rev) -> float:
+                s_walk = _bl - s if _rv else s
+                u_base = float(np.interp(np.clip(s_walk, 0.0, _bl), _sc, _us))
                 return ((u_base + _up + np.pi) % (2.0 * np.pi)) - np.pi
 
             # Column s-range: divide available width (minus side margins) into n_cols segments
@@ -486,9 +516,7 @@ def layout_signs_on_superquadric(
                     center_hint=center3,
                 )
 
-                t_v_pos = t_v  # unflipped: position offsets use paleocode y-up → 3D y-up
-                if config.flip_vertical_axis:
-                    t_v = -t_v  # flipped t_v used only for direction vectors
+                e_x, e_y = writing_frame(t_u, t_v, config)
 
                 char_in_col += 1
                 x0 = -0.5 * d['sign_w']
@@ -498,7 +526,7 @@ def layout_signs_on_superquadric(
                     wx = x0 + float(wedge.pos[0]) * d['scale']
                     wy = y0 + float(wedge.pos[1]) * d['scale']
 
-                    p3 = center3 + wx * t_u + wy * t_v_pos
+                    p3 = center3 + wx * e_x + wy * e_y
                     p3 = project_to_superquadric(
                         p3, a, b, c, epsilon, eta, iters=config.project_iters
                     )
@@ -507,7 +535,7 @@ def layout_signs_on_superquadric(
                     n3 = g / max(1e-12, np.linalg.norm(g))
 
                     d2 = np.array(wedge.direction, dtype=float).reshape(2,)
-                    d3 = d2[0] * t_u + d2[1] * t_v
+                    d3 = d2[0] * e_x + d2[1] * e_y
                     d3 = d3 - np.dot(d3, n3) * n3
                     d3 = d3 / max(1e-12, np.linalg.norm(d3))
 
@@ -517,6 +545,7 @@ def layout_signs_on_superquadric(
                             wedge_index=wedge_idx,
                             wedge_type=wedge.wedge_type,
                             size_scale=wedge.size_scale,
+                            size_class=wedge.size_class,
                             pos3=p3,
                             tail_dir3=d3,
                             normal3=n3,

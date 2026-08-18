@@ -18,6 +18,7 @@ class WedgePlacement3D:
     wedge_index: int
     wedge_type: str
     size_scale: float
+    size_class: str
     position: np.ndarray
     normal: np.ndarray
     direction: np.ndarray
@@ -161,9 +162,12 @@ def map_placed_wedges3d_to_surface(
     next_id = 1
 
     for pw in placed_wedges3d:
-        depth = float(rng.uniform(config.min_depth, config.max_depth))
-        angle = float(rng.uniform(config.min_angle, config.max_angle))
-        tilt_angle = float(rng.uniform(config.min_tilt_angle, config.max_tilt_angle))
+        # Depth and impression angle come from the wedge's own size class, so a
+        # small wedge is not pressed to the same absolute depth as a large one.
+        sizes = config.for_class(getattr(pw, "size_class", "normal"))
+        depth = float(rng.uniform(sizes.min_depth, sizes.max_depth))
+        angle = float(rng.uniform(sizes.min_angle, sizes.max_angle))
+        tilt_angle = float(rng.uniform(sizes.min_tilt_angle, sizes.max_tilt_angle))
 
         face = getattr(pw, "face", None)
         if face is None:
@@ -181,6 +185,7 @@ def map_placed_wedges3d_to_surface(
                 wedge_index=int(pw.wedge_index),
                 wedge_type=str(pw.wedge_type),
                 size_scale=float(pw.size_scale),
+                size_class=str(getattr(pw, "size_class", "normal")),
                 position=np.array(pw.pos3, dtype=float),
                 normal=np.array(pw.normal3, dtype=float),
                 direction=direction,
