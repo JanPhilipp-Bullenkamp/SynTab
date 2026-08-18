@@ -29,7 +29,14 @@ def _spow(t: np.ndarray, e: float) -> np.ndarray:
     return np.sign(t) * (np.abs(t) ** e)
 
 
-def superquadric_param(u, v, a, b, c, epsilon, eta) -> np.ndarray:
+def superquadric_param(u, v, a, b, c, epsilon, eta, *, band_axis: str = "z") -> np.ndarray:
+    """Superquadric surface point(s) for parameters (u, v).
+
+    `band_axis` names the axis the v-bands are stacked along: "z" is the plain
+    parametrisation, "y" swaps the roles of y and z so bands run around the tablet's
+    height axis.  The "y" form is only a seed — it does not lie exactly on the surface
+    and has to be projected (see `_surface_from_param`).
+    """
     eps = max(float(epsilon), 1e-9)
     et = max(float(eta), 1e-9)
 
@@ -41,28 +48,9 @@ def superquadric_param(u, v, a, b, c, epsilon, eta) -> np.ndarray:
     cv_e = _spow(cv, eps)
     sv_e = _spow(sv, eps)
 
-    x = a * cv_e * cu_e
-    y = b * cv_e * su_e
-    z = c * sv_e
-    return np.stack([x, y, z], axis=-1)
-
-
-def _superquadric_param_y_seed(u, v, a, b, c, epsilon, eta) -> np.ndarray:
-    eps = max(float(epsilon), 1e-9)
-    et = max(float(eta), 1e-9)
-
-    cu, su = np.cos(u), np.sin(u)
-    cv, sv = np.cos(v), np.sin(v)
-
-    cu_e = _spow(cu, et)
-    su_e = _spow(su, et)
-    cv_e = _spow(cv, eps)
-    sv_e = _spow(sv, eps)
-
-    x = a * cv_e * cu_e
-    y = b * sv_e
-    z = c * cv_e * su_e
-    return np.stack([x, y, z], axis=-1)
+    if band_axis == "z":
+        return np.stack([a * cv_e * cu_e, b * cv_e * su_e, c * sv_e], axis=-1)
+    return np.stack([a * cv_e * cu_e, b * sv_e, c * cv_e * su_e], axis=-1)
 
 
 def _surface_from_param(
@@ -79,11 +67,11 @@ def _surface_from_param(
 ) -> np.ndarray:
     axis = str(band_axis).lower()
     if axis == "z":
-        return superquadric_param(u, v, a, b, c, epsilon, eta)
+        return superquadric_param(u, v, a, b, c, epsilon, eta, band_axis="z")
     if axis != "y":
         raise ValueError(f"Unsupported band_axis '{band_axis}', expected 'y' or 'z'")
 
-    seeds = _superquadric_param_y_seed(u, v, a, b, c, epsilon, eta)
+    seeds = superquadric_param(u, v, a, b, c, epsilon, eta, band_axis="y")
     flat = seeds.reshape((-1, 3))
     projected = project_to_superquadric_batch(flat, a, b, c, epsilon, eta, iters=project_iters)
     return projected.reshape(seeds.shape)
@@ -254,6 +242,106 @@ def writing_frame(
     e_x = -t_u if config.flip_horizontal_axis else t_u
     e_y = -t_v if config.flip_vertical_axis else t_v
     return e_x, e_y
+
+
+def emit_sign_wedges(
+    sign,
+    scale: float,
+    center3: np.ndarray,
+    e_x: np.ndarray,
+    e_y: np.ndarray,
+    a, b, c, epsilon, eta,
+    *,
+    project_iters: int,
+    sign_index: int,
+    line_index: int,
+    char_index: int,
+    face: DIRECTION,
+) -> List[PlacedWedge3D]:
+    """Lift one sign's 2D wedges into 3D around `center3` using the writing frame.
+
+    The sign is centred on `center3`: wedge positions are taken relative to the sign's
+    own bounding box, scaled, expressed in (e_x, e_y), projected back onto the surface,
+    and each wedge's tail direction is re-orthogonalised against the *local* normal.
+    """
+    sign_w = float(sign.width * scale)
+    sign_h = float(sign.height * scale)
+    x0 = -0.5 * sign_w
+    y0 = -0.5 * sign_h
+
+    placed: List[PlacedWedge3D] = []
+    for wedge_idx, wedge in enumerate(sign.normalized_wedges()):
+        wx = x0 + float(wedge.pos[0]) * scale
+        wy = y0 + float(wedge.pos[1]) * scale
+
+        p3 = center3 + wx * e_x + wy * e_y
+        p3 = project_to_superquadric(p3, a, b, c, epsilon, eta, iters=project_iters)
+
+        _, g = superquadric_F_and_grad(p3, a, b, c, epsilon, eta)
+        n3 = g / max(1e-12, np.linalg.norm(g))
+
+        d2 = np.array(wedge.direction, dtype=float).reshape(2,)
+        d3 = d2[0] * e_x + d2[1] * e_y
+        d3 = d3 - np.dot(d3, n3) * n3
+        d3 = d3 / max(1e-12, np.linalg.norm(d3))
+
+        placed.append(
+            PlacedWedge3D(
+                sign_index=sign_index,
+                wedge_index=wedge_idx,
+                wedge_type=wedge.wedge_type,
+                size_scale=wedge.size_scale,
+                size_class=wedge.size_class,
+                pos3=p3,
+                tail_dir3=d3,
+                normal3=n3,
+                face=face,
+                sign_code=str(sign.code),
+                line_index=line_index,
+                char_index=char_index,
+            )
+        )
+
+    return placed
+
+
+def place_sign_at_front_center(
+    sign,
+    scale: float,
+    a, b, c, epsilon, eta,
+    config: Optional[LayoutConfig] = None,
+) -> List[PlacedWedge3D]:
+    """Place one sign centred on the front face (u=π/2) of the superquadric.
+
+    Used by the single-sign debug/visualisation path.  Shares `emit_sign_wedges` and
+    `writing_frame` with the production layout so the two cannot drift apart.
+    """
+    config = config or LayoutConfig()
+    u_center = np.pi / 2   # front face
+    v_center = 0.35        # slightly above equator (range: -π/2 bottom … +π/2 top)
+
+    center3 = _surface_from_param(
+        np.array([u_center]), np.array([v_center]),
+        a, b, c, epsilon, eta,
+        band_axis="y", project_iters=config.project_iters,
+    )[0]
+
+    t_u, t_v, _, _ = tangent_frame_from_param(
+        u_center, v_center, a, b, c, epsilon, eta,
+        band_axis="y", project_iters=config.project_iters,
+        delta=config.tangent_delta, center_hint=center3,
+    )
+    e_x, e_y = writing_frame(t_u, t_v, config)
+
+    _, g = superquadric_F_and_grad(center3, a, b, c, epsilon, eta)
+    n3 = g / max(1e-12, np.linalg.norm(g))
+
+    return emit_sign_wedges(
+        sign, scale, center3, e_x, e_y, a, b, c, epsilon, eta,
+        project_iters=config.project_iters,
+        sign_index=0, line_index=1, char_index=1,
+        face=face_from_normal(n3),
+    )
 
 
 def _band_arclength_u(
@@ -429,7 +517,7 @@ def layout_signs_on_superquadric(
                     else:
                         pick = int(rng.choice(candidate_pool))
 
-                    sign, wedges = sign_entries[pick]
+                    sign, _ = sign_entries[pick]
                     scale = target_height / max(1e-6, sign.height)
                     sign_w = float(sign.width * scale)
                     sign_h = float(sign.height * scale)
@@ -466,7 +554,7 @@ def layout_signs_on_superquadric(
                             continue
 
                     collected.append({
-                        'sign': sign, 'wedges': wedges, 'scale': scale,
+                        'sign': sign, 'scale': scale,
                         'sign_w': sign_w, 'sign_h': sign_h,
                         'footprint_radius': footprint_radius, 'face': face,
                     })
@@ -519,42 +607,17 @@ def layout_signs_on_superquadric(
                 e_x, e_y = writing_frame(t_u, t_v, config)
 
                 char_in_col += 1
-                x0 = -0.5 * d['sign_w']
-                y0 = -0.5 * d['sign_h']
-
-                for wedge_idx, wedge in enumerate(d['wedges']):
-                    wx = x0 + float(wedge.pos[0]) * d['scale']
-                    wy = y0 + float(wedge.pos[1]) * d['scale']
-
-                    p3 = center3 + wx * e_x + wy * e_y
-                    p3 = project_to_superquadric(
-                        p3, a, b, c, epsilon, eta, iters=config.project_iters
+                placed.extend(
+                    emit_sign_wedges(
+                        d['sign'], d['scale'], center3, e_x, e_y,
+                        a, b, c, epsilon, eta,
+                        project_iters=config.project_iters,
+                        sign_index=sign_counter,
+                        line_index=line_index,
+                        char_index=char_in_col,
+                        face=d['face'],
                     )
-
-                    _, g = superquadric_F_and_grad(p3, a, b, c, epsilon, eta)
-                    n3 = g / max(1e-12, np.linalg.norm(g))
-
-                    d2 = np.array(wedge.direction, dtype=float).reshape(2,)
-                    d3 = d2[0] * e_x + d2[1] * e_y
-                    d3 = d3 - np.dot(d3, n3) * n3
-                    d3 = d3 / max(1e-12, np.linalg.norm(d3))
-
-                    placed.append(
-                        PlacedWedge3D(
-                            sign_index=sign_counter,
-                            wedge_index=wedge_idx,
-                            wedge_type=wedge.wedge_type,
-                            size_scale=wedge.size_scale,
-                            size_class=wedge.size_class,
-                            pos3=p3,
-                            tail_dir3=d3,
-                            normal3=n3,
-                            face=d['face'],
-                            sign_code=str(d['sign'].code),
-                            line_index=line_index,
-                            char_index=char_in_col,
-                        )
-                    )
+                )
 
                 placed_centers.append(center3)
                 placed_radii.append(d['footprint_radius'])

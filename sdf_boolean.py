@@ -21,6 +21,13 @@ from scipy import ndimage
 from config import SdfConfig
 
 
+def compute_pitch(height: float, width: float, depth: float, config: SdfConfig) -> float:
+    """Voxel pitch that keeps the tablet inside `config.max_grid` cells per axis."""
+    base_extent = 2.0 * max(height, width, depth)
+    denom = max(1.0, (config.max_grid - 1) - 2.0 * config.padding)
+    return max(config.target_pitch, base_extent / denom)
+
+
 def _voxelgrid_origin(vg: trimesh.voxel.VoxelGrid) -> np.ndarray:
     if hasattr(vg, "origin"):
         return np.asarray(vg.origin, dtype=np.float64)
@@ -92,89 +99,6 @@ def sdf_from_occupancy(
     if dtype == np.float64:
         return dist_out
     return dist_out.astype(dtype, copy=False)
-
-
-def _rasterize_cutter_contains(
-    cutter: trimesh.Trimesh,
-    occB: np.ndarray,
-    origin: np.ndarray,
-    pitch: float,
-    return_indices: bool = False,
-) -> np.ndarray | None:
-    bounds = cutter.bounds
-    imin = np.floor((bounds[0] - origin) / pitch).astype(int) - 1
-    imax = np.ceil((bounds[1] - origin) / pitch).astype(int) + 1
-    imin = np.maximum(imin, 0)
-    imax = np.minimum(imax, np.array(occB.shape) - 1)
-
-    if np.any(imax < imin):
-        return None
-
-    xs = np.arange(imin[0], imax[0] + 1)
-    ys = np.arange(imin[1], imax[1] + 1)
-    zs = np.arange(imin[2], imax[2] + 1)
-
-    X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
-    pts = np.stack([X, Y, Z], axis=-1).reshape(-1, 3).astype(np.float64)
-    pts_world = origin[None, :] + pitch * pts
-
-    inside = cutter.contains(pts_world)
-    if not np.any(inside):
-        return None
-
-    inside_idx = pts[inside].astype(int)
-    ix, iy, iz = inside_idx[:, 0], inside_idx[:, 1], inside_idx[:, 2]
-    occB[ix, iy, iz] = True
-
-    if return_indices:
-        return inside_idx
-    return None
-
-
-def _rasterize_cutter_voxelized(
-    cutter: trimesh.Trimesh,
-    occB: np.ndarray,
-    origin: np.ndarray,
-    pitch: float,
-    return_indices: bool = False,
-) -> np.ndarray | None:
-    vg = cutter.voxelized(pitch)
-    vg_f = vg.fill()
-
-    mat = vg_f.matrix.astype(bool)
-    if not np.any(mat):
-        return None
-
-    vg_origin = _voxelgrid_origin(vg_f)
-    off = np.round((vg_origin - origin) / pitch).astype(int)
-
-    x0, y0, z0 = off
-    x1, y1, z1 = off + np.array(mat.shape)
-
-    dims = occB.shape
-    gx0, gy0, gz0 = max(x0, 0), max(y0, 0), max(z0, 0)
-    gx1, gy1, gz1 = min(x1, dims[0]), min(y1, dims[1]), min(z1, dims[2])
-
-    if (gx1 <= gx0) or (gy1 <= gy0) or (gz1 <= gz0):
-        return None
-
-    mx0, my0, mz0 = gx0 - x0, gy0 - y0, gz0 - z0
-    mx1, my1, mz1 = mx0 + (gx1 - gx0), my0 + (gy1 - gy0), mz0 + (gz1 - gz0)
-
-    sub = mat[mx0:mx1, my0:my1, mz0:mz1]
-    if not np.any(sub):
-        return None
-
-    occB[gx0:gx1, gy0:gy1, gz0:gz1] |= sub
-
-    if not return_indices:
-        return None
-
-    inside_local = np.argwhere(sub)
-    if inside_local.size == 0:
-        return None
-
-    return (inside_local + np.array([gx0, gy0, gz0], dtype=np.int64)).astype(np.int32)
 
 
 def _rasterize_to_indices(
@@ -320,34 +244,6 @@ def _rasterize_to_indices(
     pts_world = origin[None, :] + pitch * pts_i.astype(np.float64)
     inside = cutter.contains(pts_world)
     return pts_i[inside].astype(np.int32) if np.any(inside) else None
-
-
-def rasterize_cutter_into_grid(
-    cutter: trimesh.Trimesh,
-    occB: np.ndarray,
-    origin: np.ndarray,
-    pitch: float,
-    *,
-    method: str = "voxelize",
-    return_indices: bool = False,
-) -> np.ndarray | None:
-    if method == "voxelize":
-        try:
-            return _rasterize_cutter_voxelized(
-                cutter=cutter, occB=occB, origin=origin, pitch=pitch,
-                return_indices=return_indices,
-            )
-        except Exception:
-            return _rasterize_cutter_contains(
-                cutter=cutter, occB=occB, origin=origin, pitch=pitch,
-                return_indices=return_indices,
-            )
-    if method == "contains":
-        return _rasterize_cutter_contains(
-            cutter=cutter, occB=occB, origin=origin, pitch=pitch,
-            return_indices=return_indices,
-        )
-    raise ValueError(f"method must be 'voxelize' or 'contains', got '{method}'")
 
 
 def mesh_from_sdf(sdf: np.ndarray, origin: np.ndarray, pitch: float) -> trimesh.Trimesh:

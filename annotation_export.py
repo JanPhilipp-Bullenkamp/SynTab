@@ -1,4 +1,5 @@
-"""Export W3C WebAnnotation JSON for generated cuneiform tablets."""
+"""Export the labelled outputs of a generated tablet: per-vertex labels and
+W3C WebAnnotation JSON."""
 from __future__ import annotations
 
 import json
@@ -9,6 +10,20 @@ import numpy as np
 import trimesh
 
 from config import SdfConfig
+
+
+def export_labels(labels, filepath) -> None:
+    """Write per-vertex labels as a commented `index label` text file."""
+    with open(filepath, "w") as f:
+        f.write("# +-----------------------------------------------------+\n")
+        f.write("# | txt file with labels per index                      |\n")
+        f.write("# +-----------------------------------------------------+\n")
+        f.write("# | Format: index label                                 |\n")
+        f.write("# +-----------------------------------------------------+\n")
+        for index, label in enumerate(labels):
+            if isinstance(label, list):
+                label = " ".join(str(l) for l in label)
+            f.write(f"{index} {label}\n")
 
 
 def _textual_body(purpose: str, value: Any) -> Dict[str, object]:

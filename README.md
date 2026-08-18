@@ -46,6 +46,7 @@ All parameters are controlled in [config.py](config.py):
 | `LayoutConfig` | Sign spacing, margins, multi-column layout |
 | `PaleocodageConfig` | Stroke lengths and scaling factors |
 | `GenerationConfig` | Number of tablets, parallel workers, RNG seed |
+| `DebugTabletConfig` | Fixed tablet shape used by `generate_single_sign.py` |
 
 ## Output Format
 

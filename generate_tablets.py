@@ -28,7 +28,7 @@ from typing import Dict, Iterable, List, Optional
 
 import numpy as np
 
-from annotation_export import export_webannotation_3d
+from annotation_export import export_labels, export_webannotation_3d
 from config import TabletConfig
 from directions import DIRECTION
 from imprint import build_wedge_meshes, map_placed_wedges3d_to_surface
@@ -36,14 +36,7 @@ from layout3d import layout_signs_on_superquadric
 from paleocodage import parse_signs
 from postprocess import postprocess_mesh
 from signs import drop_signs_without_wedges, load_sign_reference_metadata, resolve_sign_codes
-from sdf_boolean import sdf_difference_with_labels
-from util import export_labels
-
-
-def _compute_pitch(height: float, width: float, depth: float, cfg: TabletConfig) -> float:
-    base_extent = 2.0 * max(height, width, depth)
-    denom = max(1.0, (cfg.sdf.max_grid - 1) - 2.0 * cfg.sdf.padding)
-    return max(cfg.sdf.target_pitch, base_extent / denom)
+from sdf_boolean import compute_pitch, sdf_difference_with_labels
 
 
 def _generate_single_tablet(
@@ -133,7 +126,7 @@ def _generate_single_tablet(
             wedge_meshes = build_wedge_meshes(wedges_3d, config=cfg.carving)
             _log(f"{atag} [build_meshes] count={len(wedge_meshes)} dt={time.perf_counter()-ts:.3f}s")
 
-            pitch = _compute_pitch(height, width, depth, cfg)
+            pitch = compute_pitch(height, width, depth, cfg.sdf)
             _log(f"{atag} [sdf] pitch={pitch:.7f}")
             ts = time.perf_counter()
             imprinted_mesh_raw, labels_raw = sdf_difference_with_labels(

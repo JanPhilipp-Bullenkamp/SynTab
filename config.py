@@ -43,6 +43,26 @@ class GeometryConfig:
 
 
 @dataclass(frozen=True)
+class DebugTabletConfig:
+    """Fixed superquadric for the single-sign debug/visualisation path.
+
+    `GeometryConfig` samples a new shape per tablet; the debug renders and the paper
+    figures need one reproducible shape instead, so these are constants rather than
+    ranges.  Values sit inside the corresponding `GeometryConfig` ranges.
+    """
+    a: float = 0.70          # x half-axis
+    b: float = 0.80          # y — height axis when band_axis="y"
+    c: float = 0.25          # z — depth
+    epsilon: float = 0.85    # z-axis roundness
+    eta: float = 0.82        # xy-plane roundness
+    scale_mm: float = 10.0   # final mesh scale in mm
+    sign_height_frac: float = 0.15   # sign height as fraction of tablet height (2 * b)
+
+
+DEBUG_TABLET = DebugTabletConfig()
+
+
+@dataclass(frozen=True)
 class WedgeSizeConfig:
     """Randomisation ranges for one wedge size class.
 
